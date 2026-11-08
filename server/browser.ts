@@ -37,6 +37,14 @@ async function launch(): Promise<Browser> {
   return chromium.launch({ ...(executablePath ? { executablePath } : { channel: "chrome" }), args: HARDENING, headless: true });
 }
 
+/** Throw the browser away (it is stuck); the next scan starts a fresh one. */
+export async function resetBrowser() {
+  const current = launching;
+  launching = null;
+  const browser = await current?.catch(() => null);
+  await Promise.race([browser?.close().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))]);
+}
+
 export async function getBrowser(): Promise<Browser> {
   if (launching) {
     const browser = await launching.catch(() => null);

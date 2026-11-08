@@ -1,6 +1,6 @@
 import type { BrowserContext, Page } from "playwright-core";
 import { GENERIC_PAGE, snapshotPage, type ScanBox, type ScanSnapshot } from "../app/lib/scanPage.ts";
-import { getBrowser, withSlot } from "./browser.ts";
+import { getBrowser, resetBrowser, withSlot } from "./browser.ts";
 import { ScanError } from "./errors.ts";
 import { REFUSED_HEADER, startGuardProxy, type ProxyStats } from "./guardProxy.ts";
 import { checkUrl } from "./urlGuard.ts";
@@ -37,7 +37,7 @@ export const BUDGET = {
   bytes: 25 * 1024 * 1024,
   boxes: 12_000,
   /** Media brightness is read from a screenshot of at most this much of the page. */
-  lumaHeight: 16_000,
+  lumaHeight: process.env.VERCEL ? 6_000 : 16_000,
 };
 
 export const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 alexsonicLAb/0.1";
@@ -54,12 +54,35 @@ const LOGIN_PATH = /\/(log-?in|sign-?in|signin|auth|sso|session|account\/login|a
 export async function scanUrl(url: URL, options: ScanOptions = DEFAULT_OPTIONS): Promise<{ snapshot: ScanSnapshot; stats: ScanStats }> {
   // Refuse before starting a browser: bad shape, private names, private DNS answers.
   await checkUrl(url);
-  return withSlot(12_000, () => render(url, options), () => new ScanError("busy"));
+  return withSlot(12_000, () => withDeadline(url, options), () => new ScanError("busy"));
+}
+
+/**
+ * The scan's own deadline, a little after its budget and well before the function's: a browser that stops
+ * answering (a page that freezes the renderer) is thrown away, and the visitor hears "timeout" instead of nothing.
+ */
+async function withDeadline(url: URL, options: ScanOptions) {
+  const limit = WAIT[options.wait].total + 2_000;
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const expired = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new ScanError("timeout", `no answer after ${limit}ms`)), limit);
+  });
+  try {
+    return await Promise.race([render(url, options), expired]);
+  } catch (error) {
+    if (error instanceof ScanError && error.code === "timeout") await resetBrowser();
+    throw error;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 async function render(url: URL, options: ScanOptions) {
   const wait = WAIT[options.wait];
   const started = Date.now();
+  // Where the time goes, in the logs: each phase's end, in ms since the start.
+  const marks: string[] = [];
+  const mark = (name: string) => marks.push(`${name}=${Date.now() - started}`);
   const proxy = await startGuardProxy({ maxConnections: BUDGET.connections, maxBytes: BUDGET.bytes });
   let context: BrowserContext | null = null;
   const deadline = setTimeout(() => void context?.close().catch(() => {}), wait.total);
@@ -93,6 +116,7 @@ async function render(url: URL, options: ScanOptions) {
       // A redirect into the private network is answered by the guard proxy, marked.
       documentStatus = reply.headers()[REFUSED_HEADER] ? -1 : reply.status();
     });
+    mark("browser");
     const response = await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: BUDGET.navigationMs }).catch((error: Error) => {
       throw navigationError(error, proxy.stats, documentStatus);
     });
@@ -103,7 +127,9 @@ async function render(url: URL, options: ScanOptions) {
     const type = (response.headers()["content-type"] ?? "").toLowerCase();
     if (type && !/html|xml/.test(type)) throw new ScanError(status >= 400 ? (status === 403 || status === 429 ? "blocked" : "http_error") : "not_html", type);
 
+    mark("goto");
     await settle(page, wait, options.maxHeight);
+    mark("settle");
     if (options.clean) await cleanBanners(page);
     const look = await page.evaluate(() => ({
       url: location.href,
@@ -115,6 +141,7 @@ async function render(url: URL, options: ScanOptions) {
     }));
     classify(status, response.headers(), look);
 
+    mark("look");
     const raw = (await page.evaluate(`(${snapshotPage.toString()})(document.body, ${JSON.stringify({ ...GENERIC_PAGE, maxHeight: options.maxHeight })})`)) as ScanSnapshot;
     // Off-screen helpers (skip links, hidden menus parked at -9999px) are not part of the page anyone sees.
     const boxes = raw.boxes
@@ -122,7 +149,10 @@ async function render(url: URL, options: ScanOptions) {
       .slice(0, options.maxHeight > 30_000 ? BUDGET.boxes * 2 : BUDGET.boxes)
       .map(clean);
     if (boxes.filter((box) => box.kind === "text" || box.kind === "heading").length < 3) throw new ScanError("empty");
-    await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
+    mark("snapshot");
+    // Image brightness needs a tall screenshot, which is slow without a GPU: only with time to spare, and capped.
+    if (Date.now() - started < wait.total * 0.45) await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
+    mark("luma");
 
     const snapshot: ScanSnapshot = {
       boxes,
@@ -139,6 +169,7 @@ async function render(url: URL, options: ScanOptions) {
     if (/closed|Target page, context or browser has been closed/i.test(message) && Date.now() - started >= wait.total - 500) throw new ScanError("timeout");
     throw new ScanError("internal", message.slice(0, 300));
   } finally {
+    console.info(`scan phases ${url.host} ${marks.join(" ")}`);
     clearTimeout(deadline);
     await context?.close().catch(() => {});
     await proxy.close();

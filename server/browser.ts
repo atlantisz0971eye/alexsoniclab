@@ -1,3 +1,6 @@
+import { readdirSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 
 /**
@@ -5,10 +8,15 @@ import { chromium, type Browser } from "playwright-core";
  * On Vercel it is @sparticuz/chromium, unpacked into /tmp on a cold start; locally it is the installed Chrome, or
  * the browser at CHROME_PATH.
  *
- * The browser is also told to send everything to a proxy that does not exist. Every request a page makes is
- * intercepted and either answered by the scanner (through the SSRF guard) or refused, so nothing should ever reach
- * that proxy; if something slips past interception (a new kind of request), it fails instead of going out.
+ * The browser's default proxy is one that does not exist: each scan's context sets its own guard proxy, so any
+ * traffic outside a context fails instead of going out.
+ *
+ * A Vercel function has one CPU and 2 GB. A page that freezes the renderer used to leave its Chromium processes
+ * running after the scan timed out, and every later scan on that instance then failed for lack of memory. So on
+ * Vercel only one page renders at a time, and a stuck browser is killed outright, processes and profile included.
  */
+
+export const ON_SERVERLESS = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
 
 const HARDENING = [
   "--proxy-server=http://127.0.0.1:9",
@@ -28,8 +36,7 @@ const HARDENING = [
 let launching: Promise<Browser> | null = null;
 
 async function launch(): Promise<Browser> {
-  const onServerless = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
-  if (onServerless) {
+  if (ON_SERVERLESS) {
     const { default: serverless } = await import("@sparticuz/chromium");
     return chromium.launch({ executablePath: await serverless.executablePath(), args: [...serverless.args, ...HARDENING], headless: true });
   }
@@ -43,6 +50,33 @@ export async function resetBrowser() {
   launching = null;
   const browser = await current?.catch(() => null);
   await Promise.race([browser?.close().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 3000))]);
+  if (ON_SERVERLESS) killStrayChromium();
+}
+
+/**
+ * On Linux (Vercel), kill every Chromium process still alive and delete the temporary profiles, so a browser that
+ * would not close cannot keep the instance's memory and disk. Not used locally, where it would hit the user's Chrome.
+ */
+function killStrayChromium() {
+  if (process.platform !== "linux") return;
+  let killed = 0;
+  for (const entry of readdirSync("/proc")) {
+    const pid = Number(entry);
+    if (!pid || pid === process.pid) continue;
+    try {
+      const command = readFileSync(`/proc/${pid}/cmdline`, "utf8");
+      if (/chrom(e|ium)/i.test(command)) {
+        process.kill(pid, "SIGKILL");
+        killed += 1;
+      }
+    } catch {
+      // The process ended meanwhile, or is not ours.
+    }
+  }
+  for (const entry of readdirSync(tmpdir())) {
+    if (entry.startsWith("playwright_chromiumdev_profile-")) rmSync(join(tmpdir(), entry), { recursive: true, force: true });
+  }
+  console.warn(`browser reset: killed ${killed} chromium process(es)`);
 }
 
 export async function getBrowser(): Promise<Browser> {
@@ -58,8 +92,8 @@ export async function getBrowser(): Promise<Browser> {
   return browser;
 }
 
-/** At most this many pages render at once on one instance; the rest wait their turn, briefly. */
-const MAX_CONCURRENT = 2;
+/** At most this many pages render at once on one instance (one on Vercel's single CPU); the rest wait, briefly. */
+const MAX_CONCURRENT = ON_SERVERLESS ? 1 : 2;
 let running = 0;
 const waiting: (() => void)[] = [];
 

@@ -91,9 +91,10 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
   const deadline = setTimeout(() => void context?.close().catch(() => {}), wait.total);
   try {
     mark("proxy");
-    const browser = await getBrowser();
+    // A browser that cannot open a context within seconds is sick: replace it once and try again.
+    let browser = await getBrowser();
     mark("launch");
-    context = await browser.newContext({
+    const contextOptions = {
       viewport: { width: options.width, height: options.height },
       colorScheme: options.dark ? "dark" : "light",
       isMobile: options.width < 600,
@@ -107,7 +108,15 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
       acceptDownloads: false,
       // Loopback is not exempt from the proxy: everything goes through the guard.
       proxy: { server: proxy.server, bypass: "<-loopback>" },
-    });
+    } satisfies Parameters<typeof browser.newContext>[0];
+    context = await within(browser.newContext(contextOptions), 8_000);
+    if (!context) {
+      mark("sick");
+      await resetBrowser();
+      browser = await getBrowser();
+      context = await within(browser.newContext(contextOptions), 8_000);
+      if (!context) throw new ScanError("busy", "no browser context");
+    }
     mark("context");
     await guardContext(context);
     const page = await context.newPage();
@@ -172,12 +181,13 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
   } catch (error) {
     if (error instanceof ScanError) throw error;
     const message = String(error);
+    if (/crash|ERR_INSUFFICIENT_RESOURCES/i.test(message)) void resetBrowser();
     if (/closed|Target page, context or browser has been closed/i.test(message) && Date.now() - started >= wait.total - 500) throw new ScanError("timeout");
     throw new ScanError("internal", message.slice(0, 300));
   } finally {
     console.info(`scan phases ${url.host} ${marks.join(" ")}`);
     clearTimeout(deadline);
-    await context?.close().catch(() => {});
+    await within(context?.close().catch(() => {}) ?? Promise.resolve(), 5_000);
     await proxy.close();
   }
 }
@@ -239,8 +249,23 @@ function classify(status: number, headers: Record<string, string>, look: { url: 
   if (status >= 400) throw new ScanError("http_error", String(status));
 }
 
+/** The promise's value, or null if it takes longer than ms. */
+async function within<T>(promise: Promise<T>, ms: number): Promise<T | null> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const late = new Promise<null>((resolve) => {
+    timer = setTimeout(() => resolve(null), ms);
+  });
+  try {
+    return await Promise.race([promise, late]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 function navigationError(error: Error, stats: ProxyStats, status: number) {
   const message = error.message ?? "";
+  // The browser ran out of memory or handles: start the next scan with a fresh one.
+  if (/ERR_INSUFFICIENT_RESOURCES|Target crashed|Page crashed/i.test(message)) void resetBrowser();
   if (status === -1) return new ScanError("private_address", stats.blockedHosts.join(","));
   if (/Timeout/i.test(message)) return new ScanError("timeout");
   if (/ERR_INVALID_AUTH_CREDENTIALS/i.test(message) || status === 401 || status === 407) return new ScanError("login");

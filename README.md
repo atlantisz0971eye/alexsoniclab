@@ -5,7 +5,41 @@
 - 读页面的是服务器：浏览器不能跨域读别人网站的 DOM 或像素。
 - 返回给前端的只有派生几何：盒子类型和坐标、每行一小段文字（最多 160 字）、分区边界、媒体亮度。**页面的 HTML 不会离开服务器。**
 - 播放端就是作品集里的 `SonicLab`（双 deck 控制台）：deck A 循环播放从扫描里截下的 1/2/4/8 小节（L 加载），deck B 是正在扫描的页面，交叉推子混两边（← →）。另外有风格、五个 player 的静音、roll、carve、SORT/MELT、录音和海报；回放链接形如 `/?url=…#perf=…`，`/?url=…&style=acid` 这类链接也照样能用。
-- 可调参数的后续规划见 [`docs/参数规划.md`](docs/参数规划.md)。
+- 所有参数都可以调，并且都写进地址栏，一个链接就能复现「哪个网站、怎么读、怎么响、谁在放」。详见下面「参数」和「AI DJ」两节，规划和进度见 [`docs/参数规划.md`](docs/参数规划.md)。
+
+## 参数
+
+网址页的 `[SETUP +]` 放 A 层；进了 Lab 以后，右上角 `[PARAMS ⚙]` 抽屉里四层都有。所有参数定义在一张表里（`app/lib/params.ts`），地址栏、服务器白名单、缓存 key 和两个面板都从这张表生成。
+
+| 层 | URL 键 | 作用 |
+| --- | --- | --- |
+| A 读取（服务器，改了要重扫，抽屉里会变成橙色并出现 RESCAN） | `w` `dark` `clean` `wait` `h` `lang` | 视口 390/1280/1920，深色模式，隐藏 Cookie 弹窗，等待 fast/normal/patient，深度 10K/30K/60K，语言 |
+| B 映射 | `row` `dir` `kinds` `cols` | 行高 10/20/40，从下往上读，只读文字/方框/图片/链接，列数 |
+| C 声音 | `bpm` `swing` `root` `drums` `breakdown` `typist` `arch` `typ` `head` `photo` `link` `delay` `reverb` `filter` `sens` | 覆盖风格自带的节奏、调、鼓型，以及五个 player 的音量、效果、滤波范围和灵敏度。不设就按风格来 |
+| D 演奏 | `auto` `axis` `curve` `ink` | 自动滚动，读头位置，交叉推子曲线，配色（分区色 / 绿 / 琥珀） |
+
+例子：
+
+```
+/?url=https://en.wikipedia.org/wiki/Techno&w=390&clean=1&row=10&bpm=140&drums=broken&ink=amber&seed=c58x4p&ai=1
+```
+
+A 层只给预设值，服务器只接受表里有的值，其他一律 400（`bad_param`）。读取参数是缓存 key 的一部分，所以每个网站最多会有几十种扫描结果；默认值不写进链接。
+
+`clean` 只隐藏常见同意工具的弹窗（OneTrust、Cookiebot、BBC 的 ConsentBanner 等）。如果隐藏后页面高度掉了 40% 以上，说明误伤了包住整页的元素，就会自动撤销。
+
+## AI DJ
+
+`[▶ AI DJ]` 是**基于种子的随机演奏**，不调用任何模型，也不联网，完全在浏览器里算。（`app/lib/aiDj.ts`）
+
+- 它看页面的形状：在哪些地方分区，每一段文字和图片有多密。然后用种子（mulberry32 伪随机）写出一整套演奏：
+  - 读头在每一段走多快、在哪里停一下、在哪里往回晃；
+  - 在分区线上换风格、静音某个 player；
+  - 抓 1/2/4/8 小节进 deck A，用交叉推子推进来，过一会儿再推出去、弹出；
+  - 段尾的 roll，偶尔的 SORT/MELT 和 carve。
+- **同一个种子在同一个页面上永远是同一套**（测试里验证过），所以种子可以分享：`&seed=c58x4p&ai=1`。`[SEED … ↻]` 换一个新种子，就是一套新的。
+- 生成的就是 Lab 回放链接用的那种格式（Performance），Lab 照回放的方式放。访客自己一滚动，就把控制权拿回来了。
+- 打开带 `ai=1` 的链接时，浏览器要求先点一下才能出声，所以会显示「REPLAY · CLICK TO PLAY」。
 
 ## 本地运行
 
@@ -37,7 +71,7 @@ npm run check:security
 
 Lab 在作品集仓库里开发，这里是逐字节的副本，清单见 `scripts/sync-lab.mjs`：
 
-`app/lib/scanPage.ts`、`sonicSignals.ts`、`sonicPlayers.ts`、`sonicSynth.ts`、`sonicPerformance.ts`、`app/data/sonicStyles.ts`、`app/components/SonicLab.tsx`、`SonicDeck.tsx`、`sonicLab.css`、`app/utils/environment.ts`。
+`app/lib/scanPage.ts`、`sonicSignals.ts`、`sonicPlayers.ts`、`sonicSynth.ts`、`sonicPerformance.ts`、`labSettings.ts`、`app/data/sonicStyles.ts`、`app/components/SonicLab.tsx`、`SonicDeck.tsx`、`sonicLab.css`、`app/utils/environment.ts`。
 
 改 Lab 时先在作品集里改，再同步：
 
@@ -50,6 +84,7 @@ npm run sync-lab -- ../alex-portfolio-starter
 1. `snapshotPage(root, options)` 改成自包含函数，靠参数决定读什么。`PORTFOLIO_PAGE` 是作品集原来的读法；`GENERIC_PAGE` 读任意网站：landmark 当分区、带边框或阴影的块当卡片、文字截断、最多读 30000px 高。服务器把这个函数的源码注入到无头页面里执行。
 2. `SonicLab` 新增 `snapshot`、`linkQuery`、`autoEnter`、`enterLabels` 四个可选属性（`enterLabels` 是大按钮的文字和下方的提示）。不传时就是作品集原来的行为。
 3. Lab 的样式移到 `app/components/sonicLab.css`，由组件自己引入。
+4. `SonicLab` 还接受 `settings`（`labSettings.ts`，B/C/D 层全部参数）、`play`（交给它放的一套演奏，比如 AI DJ）、`panel`（宿主自己的面板）。`readRow` 多了可选的行高/方向/种类，synth 多了交叉推子曲线和滤波范围。默认值和以前完全一样，作品集的 snapshot 和每一行都逐一比对过。
 
 ## 一次扫描怎么走
 
@@ -80,7 +115,7 @@ HTTPS 在代理里是不透明隧道，网站看到的是真 Chrome（TLS 指纹
 
 - `test/urlGuard.test.ts`：约 75 个地址和网址写法的判定。
 - `test/browserGuard.test.ts`：在真 Chromium 里放一个页面，用 img、iframe、css、fetch、POST、WebSocket、beacon 和整页跳转，去访问 `127.0.0.1`、`localhost`、`[::1]`、`localtest.me`、`127.0.0.1.nip.io`（随机端口和 8080）。本机监听器收到 **0** 个请求，代理拒绝了 62 条连接。另外做过反向对照：把回环地址设成免代理，监听器立刻能收到请求，说明这个测试确实能抓到泄漏。
-- `scripts/check-security.mjs`：32 项全过。包括上面那些私有地址，`postman-echo.com` 重定向到 `127.0.0.1` / `169.254.169.254` / `localtest.me`，401、403、`github.com/login`、PNG 图片、卡住的端口（超时）、不存在的域名、规范化 308，以及限流（第 9 次返回 429）。
+- `scripts/check-security.mjs`：36 项全过（新增 4 项非法读取参数）。包括上面那些私有地址，`postman-echo.com` 重定向到 `127.0.0.1` / `169.254.169.254` / `localtest.me`，401、403、`github.com/login`、PNG 图片、卡住的端口（超时）、不存在的域名、规范化 308，以及限流（第 9 次返回 429）。
 
 被拦或需要登录的页面会给出清楚的提示：
 

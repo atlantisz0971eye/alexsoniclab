@@ -2,7 +2,7 @@ import type { BrowserContext, Page } from "playwright-core";
 import { GENERIC_PAGE, snapshotPage, type ScanBox, type ScanSnapshot } from "../app/lib/scanPage.ts";
 import { getBrowser, withSlot } from "./browser.ts";
 import { ScanError } from "./errors.ts";
-import { startGuardProxy, type ProxyStats } from "./guardProxy.ts";
+import { REFUSED_HEADER, startGuardProxy, type ProxyStats } from "./guardProxy.ts";
 import { checkUrl } from "./urlGuard.ts";
 
 /**
@@ -33,7 +33,7 @@ const BOT_TEXT = [
   "unusual traffic", "access denied", "request blocked", "please enable js and disable any ad blocker", "checking your browser",
   "press & hold", "captcha", "pardon our interruption", "bot detection", "security check",
 ];
-const LOGIN_PATH = /\/(log-?in|sign-?in|signin|auth|sso|session|account\/login|accounts\/login|users\/sign_in)(\/|\?|$)/i;
+const LOGIN_PATH = /\/(log-?in|sign-?in|signin|auth|sso|session|account\/login|accounts\/login|users\/sign_in|uas\/login)(\.\w+)?(\/|\?|$)/i;
 
 export async function scanUrl(url: URL): Promise<{ snapshot: ScanSnapshot; stats: ScanStats }> {
   // Refuse before starting a browser: bad shape, private names, private DNS answers.
@@ -65,13 +65,22 @@ async function render(url: URL) {
     // Popups and new windows are closed at once.
     page.on("popup", (popup) => void popup.close().catch(() => {}));
 
+    // The status of the page itself, even when Chromium turns it into an error (a 401 challenge, an empty 403).
+    let documentStatus = 0;
+    page.on("response", (reply) => {
+      if (!reply.request().isNavigationRequest() || reply.frame() !== page.mainFrame()) return;
+      // A redirect into the private network is answered by the guard proxy, marked.
+      documentStatus = reply.headers()[REFUSED_HEADER] ? -1 : reply.status();
+    });
     const response = await page.goto(url.href, { waitUntil: "domcontentloaded", timeout: BUDGET.navigationMs }).catch((error: Error) => {
-      throw navigationError(error, proxy.stats);
+      throw navigationError(error, proxy.stats, documentStatus);
     });
     if (!response) throw new ScanError("unreachable");
+    if (documentStatus === -1) throw new ScanError("private_address", response.url());
     const status = response.status();
+    if (status === 401 || status === 407) throw new ScanError("login");
     const type = (response.headers()["content-type"] ?? "").toLowerCase();
-    if (type && !/html|xml/.test(type)) throw new ScanError("not_html", type);
+    if (type && !/html|xml/.test(type)) throw new ScanError(status >= 400 ? (status === 403 || status === 429 ? "blocked" : "http_error") : "not_html", type);
 
     await settle(page);
     const look = await page.evaluate(() => ({
@@ -115,7 +124,7 @@ async function render(url: URL) {
 }
 
 /** Second line of defence inside the browser, and the budget for kinds of requests a scan does not need. */
-async function guardContext(context: BrowserContext) {
+export async function guardContext(context: BrowserContext) {
   await context.route("**/*", async (route) => {
     const request = route.request();
     const target = request.url();
@@ -155,16 +164,20 @@ function classify(status: number, headers: Record<string, string>, look: { url: 
   const botText = BOT_TEXT.some((phrase) => title.includes(phrase) || (look.words < 400 && look.text.includes(phrase)));
   if (botHeader || look.challenge || (botText && (status >= 400 || look.words < 400))) throw new ScanError("blocked");
   if (status === 401 || status === 407) throw new ScanError("login");
-  if (status === 403 || status === 429) throw new ScanError("blocked");
-  // Sent to a login form, or the page is little more than one.
+  // Sent to a login form (or a wall in front of one), or the page is little more than one.
   const path = new URL(look.url).pathname + new URL(look.url).search;
-  if (LOGIN_PATH.test(path) || (look.password && look.words < 250)) throw new ScanError("login");
+  if (LOGIN_PATH.test(path) || /authwall|loginwall|signup/i.test(path) || (look.password && look.words < 500)) throw new ScanError("login");
+  if (status === 403 || status === 429 || status === 999) throw new ScanError("blocked");
   if (status >= 400) throw new ScanError("http_error", String(status));
 }
 
-function navigationError(error: Error, stats: ProxyStats) {
+function navigationError(error: Error, stats: ProxyStats, status: number) {
   const message = error.message ?? "";
+  if (status === -1) return new ScanError("private_address", stats.blockedHosts.join(","));
   if (/Timeout/i.test(message)) return new ScanError("timeout");
+  if (/ERR_INVALID_AUTH_CREDENTIALS/i.test(message) || status === 401 || status === 407) return new ScanError("login");
+  if (status === 403 || status === 429) return new ScanError("blocked");
+  if (status >= 400) return new ScanError("http_error", String(status));
   if (/Download is starting/i.test(message)) return new ScanError("not_html");
   if (/ERR_TUNNEL_CONNECTION_FAILED|ERR_PROXY|ERR_BLOCKED/i.test(message) && stats.blocked > 0) return new ScanError("private_address", stats.blockedHosts.join(","));
   if (/ERR_TOO_MANY_REDIRECTS/i.test(message)) return new ScanError("too_many_redirects");

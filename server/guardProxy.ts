@@ -12,6 +12,8 @@ import { checkUrlShape, resolvePublic } from "./urlGuard.ts";
  * It also enforces the scan's budget: connections and bytes.
  */
 
+export const REFUSED_HEADER = "x-scan-guard";
+
 export type ProxyStats = { connections: number; bytes: number; blocked: number; blockedHosts: string[] };
 export type GuardProxy = { server: string; stats: ProxyStats; close: () => Promise<void> };
 
@@ -68,7 +70,8 @@ export async function startGuardProxy(budget: { maxConnections: number; maxBytes
       address = await guard(url);
     } catch {
       block(url.hostname);
-      response.writeHead(403).end();
+      // Marked, so the scan can tell the guard's refusal from a site's own 403.
+      response.writeHead(403, { [REFUSED_HEADER]: "private" }).end();
       return;
     }
     const headers = { ...request.headers };

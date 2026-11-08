@@ -1,4 +1,5 @@
 import { PLAYERS, type PlayerId, type SonicStyle } from "../data/sonicStyles";
+import type { CrossfadeCurve } from "./labSettings";
 import { hitPlayer, type Hit } from "./sonicPlayers";
 
 /** Deck A plays a captured loop, deck B the live scan; the crossfader sets how much of each is heard. */
@@ -18,6 +19,8 @@ export class SonicSynth {
   readonly analyser: AnalyserNode;
   private style: SonicStyle;
   private pending: SonicStyle | null = null;
+  private curve: CrossfadeCurve = "power";
+  private xfade = 1;
   private bus: GainNode;
   private filter: BiquadFilterNode;
   private output: GainNode;
@@ -136,7 +139,8 @@ export class SonicSynth {
 
   /** Change style at the next bar line, so the groove never breaks mid-bar. */
   setStyle(style: SonicStyle) {
-    this.pending = style.id === this.style.id ? null : style;
+    // The same style object is no change; a copy with changed numbers (tempo, swing) comes in at the bar line.
+    this.pending = style === this.style || (style.id === this.style.id && sameNumbers(style, this.style)) ? null : style;
   }
 
   private applyStyle(style: SonicStyle) {
@@ -152,12 +156,20 @@ export class SonicSynth {
     for (const deck of ["a", "b"]) this.channels.get(`${deck}:${player}`)?.gain.setTargetAtTime(Math.max(0, Math.min(1, level)), this.context.currentTime, 0.03);
   }
 
-  /** The crossfader: 0 is deck A alone, 1 is deck B alone, with equal-power curves in between. */
+  /** The crossfader: 0 is deck A alone, 1 is deck B alone, with equal-power curves in between (or linear, or a cut). */
   setCrossfade(x: number) {
     const v = Math.max(0, Math.min(1, x));
+    this.xfade = v;
     const now = this.context.currentTime;
-    this.decks.get("a")?.gain.setTargetAtTime(Math.cos((v * Math.PI) / 2), now, 0.02);
-    this.decks.get("b")?.gain.setTargetAtTime(Math.sin((v * Math.PI) / 2), now, 0.02);
+    const [a, b] = this.curve === "linear" ? [1 - v, v] : this.curve === "cut" ? [v < 0.5 ? 1 : 0, v < 0.5 ? 0 : 1] : [Math.cos((v * Math.PI) / 2), Math.sin((v * Math.PI) / 2)];
+    this.decks.get("a")?.gain.setTargetAtTime(a, now, 0.02);
+    this.decks.get("b")?.gain.setTargetAtTime(b, now, 0.02);
+  }
+
+  setCurve(curve: CrossfadeCurve) {
+    if (curve === this.curve) return;
+    this.curve = curve;
+    this.setCrossfade(this.xfade);
   }
 
   /** Delay and reverb amount, 0 to 1, where 0.5 is the style's own amount. */
@@ -173,9 +185,9 @@ export class SonicSynth {
   }
 
   /** The master filter: the faster the page is scanned, the brighter it gets. Returns the cutoff in Hz. */
-  setBrightness(amount: number) {
+  setBrightness(amount: number, range = { min: 380, max: 9580 }) {
     const a = Math.max(0, Math.min(1, amount));
-    const cutoff = 380 + Math.pow(a, 0.7) * 9200;
+    const cutoff = range.min + Math.pow(a, 0.7) * (range.max - range.min);
     this.filter.frequency.setTargetAtTime(cutoff, this.context.currentTime, 0.08);
     this.filter.Q.setTargetAtTime(2 + a * 5, this.context.currentTime, 0.2);
     return cutoff;
@@ -454,4 +466,9 @@ export class SonicSynth {
     osc.start(t);
     osc.stop(t + 0.12);
   }
+}
+
+/** Two versions of one style that play the same: no need to switch at the bar line. */
+function sameNumbers(a: SonicStyle, b: SonicStyle) {
+  return a.bpm === b.bpm && a.swing === b.swing && a.root === b.root && a.breakdown === b.breakdown && a.typist === b.typist && a.kick.join() === b.kick.join() && a.snare.join() === b.snare.join();
 }

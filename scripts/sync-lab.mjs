@@ -10,6 +10,7 @@ export const SHARED = [
   "app/lib/sonicPlayers.ts",
   "app/lib/sonicSynth.ts",
   "app/lib/sonicPerformance.ts",
+  "app/lib/labSettings.ts",
   "app/data/sonicStyles.ts",
   "app/components/SonicLab.tsx",
   "app/components/SonicDeck.tsx",

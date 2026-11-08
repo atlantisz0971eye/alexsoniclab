@@ -8,7 +8,7 @@ import type { DeckState } from "../components/SonicDeck";
 
 export type PerformanceEvent =
   | [number, "y", number] // read head position
-  | [number, "deck", DeckState]
+  | [number, "deck", Partial<DeckState>] // a recording keeps the whole deck; a generated set may change only some of it
   | [number, "load", number] // bars captured into deck A, 0 = eject
   | [number, "xfade", number] // crossfader, 0 = deck A, 1 = deck B
   | [number, "roll", number] // roll length in sixteenths, 0 = release
@@ -16,7 +16,7 @@ export type PerformanceEvent =
   | [number, "carve", number[]];
 
 export type PixelMode = "normal" | "sort" | "melt";
-export type Performance = { v: 1; width: number; y0: number; deck: DeckState; events: PerformanceEvent[] };
+export type Performance = { v: 1; width: number; y0: number; deck: Partial<DeckState>; events: PerformanceEvent[] };
 
 const toBase64Url = (bytes: Uint8Array) => btoa(String.fromCharCode(...bytes)).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
 const fromBase64Url = (text: string) => Uint8Array.from(atob(text.replace(/-/g, "+").replace(/_/g, "/")), (c) => c.charCodeAt(0));

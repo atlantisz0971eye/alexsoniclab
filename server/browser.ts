@@ -3,6 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { chromium, type Browser } from "playwright-core";
 
+export type { Browser };
+
 /**
  * One headless Chromium per warm server instance, reused across scans (each scan gets its own fresh context).
  * On Vercel it is @sparticuz/chromium, unpacked into /tmp on a cold start; locally it is the installed Chrome, or
@@ -11,9 +13,9 @@ import { chromium, type Browser } from "playwright-core";
  * The browser's default proxy is one that does not exist: each scan's context sets its own guard proxy, so any
  * traffic outside a context fails instead of going out.
  *
- * A Vercel function has one CPU and 2 GB. A page that freezes the renderer used to leave its Chromium processes
- * running after the scan timed out, and every later scan on that instance then failed for lack of memory. So on
- * Vercel only one page renders at a time, and a stuck browser is killed outright, processes and profile included.
+ * A Vercel function has one CPU and 2 GB, and its Chromium runs in single-process mode, where a second session in
+ * the same browser often hangs while opening its page. So on Vercel every scan launches its own browser and kills it
+ * afterwards (processes and profile included), and only one page renders at a time. Locally one browser is reused.
  */
 
 export const ON_SERVERLESS = !!process.env.VERCEL || !!process.env.AWS_LAMBDA_FUNCTION_NAME;
@@ -57,7 +59,7 @@ export async function resetBrowser() {
  * On Linux (Vercel), kill every Chromium process still alive and delete the temporary profiles, so a browser that
  * would not close cannot keep the instance's memory and disk. Not used locally, where it would hit the user's Chrome.
  */
-function killStrayChromium() {
+function killStrayChromium(report = true) {
   if (process.platform !== "linux") return;
   let killed = 0;
   for (const entry of readdirSync("/proc")) {
@@ -76,7 +78,18 @@ function killStrayChromium() {
   for (const entry of readdirSync(tmpdir())) {
     if (entry.startsWith("playwright_chromiumdev_profile-")) rmSync(join(tmpdir(), entry), { recursive: true, force: true });
   }
-  console.warn(`browser reset: killed ${killed} chromium process(es)`);
+  if (report || killed) console.warn(`browser reset: killed ${killed} chromium process(es)`);
+}
+
+/** On Vercel a fresh browser for one scan, to be passed to releaseBrowser; locally the shared one. */
+export async function acquireBrowser(): Promise<Browser> {
+  return ON_SERVERLESS ? launch() : getBrowser();
+}
+
+export async function releaseBrowser(browser: Browser | null) {
+  if (!ON_SERVERLESS || !browser) return;
+  await Promise.race([browser.close().catch(() => {}), new Promise((resolve) => setTimeout(resolve, 4000))]);
+  killStrayChromium(false);
 }
 
 export async function getBrowser(): Promise<Browser> {

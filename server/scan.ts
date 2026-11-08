@@ -1,6 +1,6 @@
 import type { BrowserContext, Page } from "playwright-core";
 import { GENERIC_PAGE, snapshotPage, type ScanBox, type ScanSnapshot } from "../app/lib/scanPage.ts";
-import { getBrowser, resetBrowser, withSlot } from "./browser.ts";
+import { acquireBrowser, ON_SERVERLESS, releaseBrowser, resetBrowser, withSlot, type Browser } from "./browser.ts";
 import { ScanError } from "./errors.ts";
 import { REFUSED_HEADER, startGuardProxy, type ProxyStats } from "./guardProxy.ts";
 import { checkUrl } from "./urlGuard.ts";
@@ -37,7 +37,7 @@ export const BUDGET = {
   bytes: 25 * 1024 * 1024,
   boxes: 12_000,
   /** Media brightness is read from a screenshot of at most this much of the page. */
-  lumaHeight: process.env.VERCEL ? 3_000 : 16_000,
+  lumaHeight: 16_000,
 };
 
 export const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 alexsonicLAb/0.1";
@@ -88,11 +88,13 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
   const mark = (name: string) => marks.push(`${name}=${Date.now() - started}`);
   const proxy = await startGuardProxy({ maxConnections: BUDGET.connections, maxBytes: BUDGET.bytes });
   let context: BrowserContext | null = null;
+  let owned: Browser | null = null;
   const deadline = setTimeout(() => void context?.close().catch(() => {}), wait.total);
   try {
     mark("proxy");
     // A browser that cannot open a context within seconds is sick: replace it once and try again.
-    let browser = await getBrowser();
+    let browser = await acquireBrowser();
+    owned = browser;
     mark("launch");
     const contextOptions = {
       viewport: { width: options.width, height: options.height },
@@ -112,8 +114,10 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
     context = await within(browser.newContext(contextOptions), 8_000);
     if (!context) {
       mark("sick");
+      await releaseBrowser(owned);
       await resetBrowser();
-      browser = await getBrowser();
+      browser = await acquireBrowser();
+      owned = browser;
       context = await within(browser.newContext(contextOptions), 8_000);
       if (!context) throw new ScanError("busy", "no browser context");
     }
@@ -165,8 +169,8 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
       .map(clean);
     if (boxes.filter((box) => box.kind === "text" || box.kind === "heading").length < 3) throw new ScanError("empty");
     mark("snapshot");
-    // Image brightness needs a tall screenshot, which is slow without a GPU: only with time to spare, and capped.
-    if (Date.now() - started < wait.total * (process.env.VERCEL ? 0.3 : 0.45)) await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
+    // Image brightness needs a screenshot as tall as the page, far too slow without a GPU: locally only.
+    if (!ON_SERVERLESS && Date.now() - started < wait.total * 0.45) await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
     mark("luma");
 
     const snapshot: ScanSnapshot = {
@@ -188,6 +192,7 @@ async function render(url: URL, options: ScanOptions, marks: string[] = []) {
     console.info(`scan phases ${url.host} ${marks.join(" ")}`);
     clearTimeout(deadline);
     await within(context?.close().catch(() => {}) ?? Promise.resolve(), 5_000);
+    await releaseBrowser(owned);
     await proxy.close();
   }
 }

@@ -4,7 +4,8 @@
 
 - 读页面的是服务器：浏览器不能跨域读别人网站的 DOM 或像素。
 - 返回给前端的只有派生几何：盒子类型和坐标、每行一小段文字（最多 160 字）、分区边界、媒体亮度。**页面的 HTML 不会离开服务器。**
-- 播放端就是作品集里的 `SonicLab`：风格、五个 player、loop/roll、remix 路由、carve、SORT/MELT、录音、回放链接都能用。分享链接和回放链接形如 `/?url=…&style=…`、`/?url=…#perf=…`。
+- 播放端就是作品集里的 `SonicLab`（双 deck 控制台）：deck A 循环播放从扫描里截下的 1/2/4/8 小节（L 加载），deck B 是正在扫描的页面，交叉推子混两边（← →）。另外有风格、五个 player 的静音、roll、carve、SORT/MELT、录音和海报；回放链接形如 `/?url=…#perf=…`，`/?url=…&style=acid` 这类链接也照样能用。
+- 可调参数的后续规划见 [`docs/参数规划.md`](docs/参数规划.md)。
 
 ## 本地运行
 
@@ -47,7 +48,7 @@ npm run sync-lab -- ../alex-portfolio-starter
 为此作品集那边做了三处改动（作品集里的 Lab 行为不变，已经逐个盒子、逐行比对过）：
 
 1. `snapshotPage(root, options)` 改成自包含函数，靠参数决定读什么。`PORTFOLIO_PAGE` 是作品集原来的读法；`GENERIC_PAGE` 读任意网站：landmark 当分区、带边框或阴影的块当卡片、文字截断、最多读 30000px 高。服务器把这个函数的源码注入到无头页面里执行。
-2. `SonicLab` 新增 `snapshot`、`linkQuery`、`autoEnter`、`enterLabels` 四个可选属性。不传时就是作品集原来的行为。
+2. `SonicLab` 新增 `snapshot`、`linkQuery`、`autoEnter`、`enterLabels` 四个可选属性（`enterLabels` 是大按钮的文字和下方的提示）。不传时就是作品集原来的行为。
 3. Lab 的样式移到 `app/components/sonicLab.css`，由组件自己引入。
 
 ## 一次扫描怎么走

@@ -139,25 +139,33 @@ HTTPS 在代理里是不透明隧道，网站看到的是真 Chrome（TLS 指纹
 
 在浏览器里打开过 Wikipedia、BBC 和作品集这三个：都显示成 ASCII，点开声音后示波器、电平表和步进灯都在动；按 4 切 ambient、按 P 切 SORT 也正常。返回给前端的 JSON：Wikipedia 约 680 KB，BBC 约 100 KB（Vercel 会再 gzip）。
 
-## Vercel：限制和费用
+## Vercel：部署、限制和费用
 
-**还没有部署，也没有建 Vercel 项目。** 要上线请先告诉我。以下是按文档和本地构建估算的：
+**线上地址：https://alexsoniclab.vercel.app**（Vercel 团队 AlexZhao's projects，项目 `alexsoniclab`）。代码在公开仓库 https://github.com/atlantisz0971eye/alexsoniclab ，**推送到 `main` 会自动部署到生产环境**。
 
-已核实的：
+在 Vercel 上实测（2026-11-08，iad1，Hobby，Fluid compute，默认内存）：
 
-- 函数打包后不能超过 **250 MB（未压缩）**。本项目 `/api/scan` 追踪出的文件约 **75 MB**（`@sparticuz/chromium` 67 MB，`playwright-core` 7 MB），够用。
-- `maxDuration` 在 `vercel.json` 和路由里都设成 60 秒。开了 Fluid compute 时，内存要在 Dashboard 里设，不能写在 `vercel.json` 里；Chromium 建议 2 GB 以上。
-- Vercel 会覆盖 `x-forwarded-for` / `x-real-ip`，客户端伪造不了，所以按 `x-real-ip` 限流是可靠的。
-- 内存里的缓存和限流只在单个实例内有效：实例之间不共享，冷启动后清空。跨实例的缓存靠 CDN（`s-maxage`）。要让限流精确，可以用 Vercel WAF 的 `@vercel/firewall` `checkRateLimit`，或者 Upstash Redis。
+| 网站 | 扫描用时 | 说明 |
+| --- | --- | --- |
+| text.npr.org | 5.4 s | 冷启动 |
+| brittanychiang.com | 11.4 s | 冷启动：启动 Chromium 4.3 s |
+| www.bbc.com/news | 13.6 s | 其中算图片亮度 5 s |
+| en.wikipedia.org/wiki/Techno | 21.2 s | 其中算图片亮度 10 s（之后已减半） |
 
-未核实的（价格以 vercel.com/pricing 为准，下面是我记得的数，可能过时）：
+同样的页面在本地 Mac 上只要 2–9 秒，Vercel 上慢 2–3 倍（CPU 少，没有 GPU）。
 
-- Fluid compute 按「活跃 CPU 时间 + 预置内存 GB·小时 + 调用次数」计费：大约 $0.128/CPU 小时、$0.0106/GB 小时、$0.60/百万次调用（iad1）。
-- 一次没命中缓存的扫描约 2–9 秒墙钟，按 2 GB、平均 5 秒、约 3 秒活跃 CPU 算，**每次约 $0.0001–0.0002，也就是每 1000 次 $0.1–0.2**，冷启动另算（解压 Chromium 要几秒，本地没法测）。
-- Hobby 每月包含的额度大约能跑几千次扫描。但 Hobby 只限非商业用途，正式公开用建议上 Pro。
-- 返回的 JSON 每次 0.1–0.7 MB，会计入流量。
+遇到的限制和对应的改动：
 
-上线前还要在 Vercel 上真跑一遍：本地用的是装在电脑上的 Chrome，`@sparticuz/chromium` 只在打包层面验证过（文件都被追踪进去了），还没在 Vercel 的 Linux 上实际启动过。
+- **函数最长 60 秒：**第一次扫 Wikipedia 超时了（`Task timed out after 60 seconds`），函数一直没有回应。现在每次扫描都有自己的截止时间（fast 32 s / normal 42 s / patient 57 s）：到点就返回 `timeout`，并且把卡住的浏览器扔掉，下一次重新启动。
+- **没有 GPU，长截图很贵：**算图片亮度要拍整页截图，在 Vercel 上只截前 3000px；并且只在用掉的时间不到预算 30% 时才做。来不及就用默认亮度。
+- **每次扫描的各阶段耗时都写进日志**（`scan phases …`；卡住时是 `scan stuck …`），在 Vercel 的 Logs 里能看到慢在哪一步。
+- **打包大小**约 75 MB，在 250 MB 限制以内；每次构建 25–35 秒。
+- **限流只在单个实例内有效：**同一个 IP 打到不同实例时会分别计数（实测在不同实例上超过了 8 次）。要精确限流，需要 Vercel WAF 的 `checkRateLimit` 或 Upstash Redis。CDN 缓存（`s-maxage=3600`）是跨实例的。
+- **部署时用的是这台 Mac 上已登录的 Vercel CLI（`npx vercel`）：**Vercel 连接器没有创建项目和读部署记录的权限（403）。
+
+在线上做过的安全检查：`127.0.0.1`、`169.254.169.254`、`localtest.me`，以及 postman-echo 重定向到元数据地址，都返回 `private_address`。
+
+费用：价格以 vercel.com/pricing 为准，下面是我记得的数，可能过时。一次没命中缓存的扫描大约是 5–20 秒墙钟、几秒 CPU，按约 $0.128/CPU 小时、$0.0106/GB 小时估算，**每 1000 次约 $0.2–0.5**。Hobby 每月的免费额度大约够几千次扫描。Hobby 只限非商业用途。
 
 ## 已知的不足
 

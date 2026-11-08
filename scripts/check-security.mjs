@@ -69,6 +69,15 @@ const canonicalOk = canonical.code === "canonical" && canonical.location?.includ
 if (!canonicalOk) failed += 1;
 console.log(`${canonicalOk ? "PASS" : "FAIL"}  canonical        308  example.com -> ${canonical.location}`);
 
+// Reading settings: only offered values; anything else is refused before a browser starts.
+for (const [query, expected] of [["w=99999", "bad_param"], ["wait=forever", "bad_param"], ["h=1000000", "bad_param"], ["lang=../../etc", "bad_param"]]) {
+  const response = await fetch(`${base}/api/scan?url=${encodeURIComponent("https://example.com/")}&${query}`, { headers: { "x-real-ip": `198.51.100.${ip++}` }, redirect: "manual" });
+  const body = await response.json();
+  const ok = body.code === expected;
+  if (!ok) failed += 1;
+  console.log(`${ok ? "PASS" : "FAIL"}  ${expected.padEnd(16)} ${String(response.status).padEnd(4)} ${query}${ok ? "" : `  -> ${body.code}`}`);
+}
+
 // Rate limit: the ninth scan from one address inside ten minutes is refused.
 const address = `203.0.113.${Math.floor(Math.random() * 200) + 1}`;
 const codes = [];
@@ -77,5 +86,5 @@ const limited = codes.slice(0, 8).every((c) => c === "private_address") && codes
 if (!limited) failed += 1;
 console.log(`${limited ? "PASS" : "FAIL"}  rate_limited          9 scans from ${address}: ${codes.join(", ")}`);
 
-console.log(failed ? `\n${failed} check(s) failed` : `\nall ${CASES.length + 2} checks passed`);
+console.log(failed ? `\n${failed} check(s) failed` : `\nall ${CASES.length + 6} checks passed`);
 process.exit(failed ? 1 : 0);

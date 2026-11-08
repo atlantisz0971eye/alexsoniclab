@@ -96,3 +96,53 @@ button:disabled { cursor: default; opacity: .45; }
 @media (max-width: 640px) {
   .home__input { font-size: 16px; }
 }
+
+/* Parameters: ASCII keys for choices, thin sliders for ranges. */
+.params { display: grid; gap: 14px; }
+.params__title { color: var(--ink); margin-bottom: 4px; letter-spacing: .04em; }
+.params__row { display: grid; grid-template-columns: 13ch 1fr; align-items: center; gap: 8px; min-height: 22px; }
+.params__row.is-dirty .params__label { color: #ffb840; }
+.params__label { color: var(--dim); white-space: nowrap; }
+.params__choices { display: flex; flex-wrap: wrap; gap: 2px 8px; }
+.params button.is-key { color: var(--key); }
+.params button.is-key:hover { color: var(--bg); background: var(--ink); }
+.params button.is-on { color: var(--bg); background: var(--on); }
+.params__range { display: flex; align-items: center; gap: 10px; }
+.params__range input { flex: 1; min-width: 0; accent-color: var(--on); height: 14px; }
+.params__range output { width: 6ch; color: var(--ink); text-align: right; }
+
+.home__setup { margin-top: 12px; }
+.home__setup > button { color: var(--key); }
+.home__setup .params { margin-top: 12px; padding: 12px; border: 1px solid #3c3f45; }
+
+/* The drawer over the Lab: PARAMS, the AI DJ and its seed. */
+.lab-drawer {
+  position: absolute;
+  top: 34px;
+  right: 2.2vw;
+  z-index: 6;
+  max-width: min(560px, calc(100vw - 32px));
+  color: var(--mid);
+  font: 12px/1.45 ui-monospace, "SF Mono", Menlo, "JetBrains Mono", monospace;
+  cursor: default;
+}
+.lab-drawer__bar { display: flex; justify-content: flex-end; flex-wrap: wrap; gap: 4px 10px; }
+.lab-drawer button { color: var(--key); white-space: pre; }
+.lab-drawer button.is-on { color: var(--bg); background: var(--on); }
+.lab-drawer button.is-key:hover { color: var(--bg); background: var(--ink); }
+.lab-drawer__body {
+  margin-top: 8px;
+  max-height: calc(var(--lab-axis-room, 52vh));
+  overflow: auto;
+  padding: 12px 14px;
+  border: 1px solid #3c3f45;
+  background: rgba(11, 11, 12, .96);
+  overscroll-behavior: contain;
+}
+.lab-drawer__rescan { margin-top: 12px; color: #ffb840 !important; }
+.lab-source { right: calc(2.2vw + 300px); }
+@media (max-width: 640px) {
+  .lab-source { right: 2.2vw; top: 4px; }
+  .lab-drawer { top: 24px; }
+  .params__row { grid-template-columns: 11ch 1fr; }
+}

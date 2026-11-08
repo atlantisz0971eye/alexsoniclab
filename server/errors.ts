@@ -1,6 +1,7 @@
 /** Every way a scan can fail, with the HTTP status the API answers and what the visitor is told. */
 export const SCAN_ERRORS = {
   bad_url: [400, "That does not look like a web address."],
+  bad_param: [400, "One of the reading settings has a value that is not offered."],
   bad_scheme: [400, "Only http:// and https:// pages can be read."],
   bad_port: [400, "Only pages on the usual web ports (80, 443, 8080, 8443) can be read."],
   private_address: [403, "That address points into a private network, so it is not read."],

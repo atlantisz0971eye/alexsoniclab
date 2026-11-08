@@ -4,6 +4,7 @@ import { getBrowser, withSlot } from "./browser.ts";
 import { ScanError } from "./errors.ts";
 import { REFUSED_HEADER, startGuardProxy, type ProxyStats } from "./guardProxy.ts";
 import { checkUrl } from "./urlGuard.ts";
+import type { ScanOptions } from "../app/lib/params.ts";
 
 /**
  * Reads another site the way the portfolio Lab reads the portfolio: renders it in headless Chromium at a fixed
@@ -11,12 +12,27 @@ import { checkUrl } from "./urlGuard.ts";
  * a short run of letters per line, section edges and the brightness of media. The page's HTML never leaves here.
  */
 
-export const VIEWPORT = { width: 1280, height: 800 };
+export const DEFAULT_OPTIONS: ScanOptions = { width: 1280, height: 800, dark: false, clean: false, wait: "normal", maxHeight: 30_000, lang: "en" };
+
+/** How long a page gets: to load, to go quiet on the network, and to be scrolled through for lazy content. */
+const WAIT = {
+  fast: { load: 3_000, idle: 1_000, scroll: 2_000, total: 30_000 },
+  normal: { load: 6_000, idle: 2_500, scroll: 4_000, total: 40_000 },
+  patient: { load: 14_000, idle: 5_000, scroll: 8_000, total: 55_000 },
+};
+
+/** Cookie and consent banners from the common consent tools, hidden when the visitor asks for a clean read. */
+const CLEAN_CSS = `
+  #onetrust-banner-sdk, #onetrust-consent-sdk, #CybotCookiebotDialog, .fc-consent-root, .qc-cmp2-container,
+  [id^="sp_message_container"], #usercentrics-root, #didomi-host, .cc-window, #cookie-banner, .cookie-banner,
+  [id*="cookie-consent" i], [class*="cookie-consent" i], [id*="cookieconsent" i], [class*="cookieconsent" i],
+  [role="dialog"][aria-label*="cookie" i], [role="dialog"][aria-label*="consent" i],
+  [role="region"][aria-label*="cookie" i], [aria-labelledby*="cookie" i], [aria-labelledby*="consent" i],
+  [class*="consentbanner" i], [class*="consent-banner" i], [id*="consent-banner" i], [class*="cookiebanner" i], [id*="cookiebanner" i]
+  { display: none !important; }
+`;
 export const BUDGET = {
-  /** The whole scan, from opening a context to the snapshot. */
-  totalMs: 40_000,
   navigationMs: 20_000,
-  settleMs: 6_000,
   connections: 300,
   bytes: 25 * 1024 * 1024,
   boxes: 12_000,
@@ -35,24 +51,29 @@ const BOT_TEXT = [
 ];
 const LOGIN_PATH = /\/(log-?in|sign-?in|signin|auth|sso|session|account\/login|accounts\/login|users\/sign_in|uas\/login)(\.\w+)?(\/|\?|$)/i;
 
-export async function scanUrl(url: URL): Promise<{ snapshot: ScanSnapshot; stats: ScanStats }> {
+export async function scanUrl(url: URL, options: ScanOptions = DEFAULT_OPTIONS): Promise<{ snapshot: ScanSnapshot; stats: ScanStats }> {
   // Refuse before starting a browser: bad shape, private names, private DNS answers.
   await checkUrl(url);
-  return withSlot(12_000, () => render(url), () => new ScanError("busy"));
+  return withSlot(12_000, () => render(url, options), () => new ScanError("busy"));
 }
 
-async function render(url: URL) {
+async function render(url: URL, options: ScanOptions) {
+  const wait = WAIT[options.wait];
   const started = Date.now();
   const proxy = await startGuardProxy({ maxConnections: BUDGET.connections, maxBytes: BUDGET.bytes });
   let context: BrowserContext | null = null;
-  const deadline = setTimeout(() => void context?.close().catch(() => {}), BUDGET.totalMs);
+  const deadline = setTimeout(() => void context?.close().catch(() => {}), wait.total);
   try {
     const browser = await getBrowser();
     context = await browser.newContext({
-      viewport: VIEWPORT,
+      viewport: { width: options.width, height: options.height },
+      colorScheme: options.dark ? "dark" : "light",
+      isMobile: options.width < 600,
+      hasTouch: options.width < 600,
       deviceScaleFactor: 1,
       userAgent: USER_AGENT,
-      locale: "en-US",
+      locale: options.lang,
+      extraHTTPHeaders: { "accept-language": `${options.lang},en;q=0.5` },
       reducedMotion: "reduce",
       serviceWorkers: "block",
       acceptDownloads: false,
@@ -82,7 +103,8 @@ async function render(url: URL) {
     const type = (response.headers()["content-type"] ?? "").toLowerCase();
     if (type && !/html|xml/.test(type)) throw new ScanError(status >= 400 ? (status === 403 || status === 429 ? "blocked" : "http_error") : "not_html", type);
 
-    await settle(page);
+    await settle(page, wait, options.maxHeight);
+    if (options.clean) await cleanBanners(page);
     const look = await page.evaluate(() => ({
       url: location.href,
       title: document.title,
@@ -93,14 +115,14 @@ async function render(url: URL) {
     }));
     classify(status, response.headers(), look);
 
-    const raw = (await page.evaluate(`(${snapshotPage.toString()})(document.body, ${JSON.stringify(GENERIC_PAGE)})`)) as ScanSnapshot;
+    const raw = (await page.evaluate(`(${snapshotPage.toString()})(document.body, ${JSON.stringify({ ...GENERIC_PAGE, maxHeight: options.maxHeight })})`)) as ScanSnapshot;
     // Off-screen helpers (skip links, hidden menus parked at -9999px) are not part of the page anyone sees.
     const boxes = raw.boxes
       .filter((box) => box.bottom > 0 && box.right > 0 && box.left < raw.width && box.top < raw.height)
-      .slice(0, BUDGET.boxes)
+      .slice(0, options.maxHeight > 30_000 ? BUDGET.boxes * 2 : BUDGET.boxes)
       .map(clean);
     if (boxes.filter((box) => box.kind === "text" || box.kind === "heading").length < 3) throw new ScanError("empty");
-    await readMediaBrightness(context, page, boxes, raw.height).catch(() => {});
+    await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
 
     const snapshot: ScanSnapshot = {
       boxes,
@@ -114,7 +136,7 @@ async function render(url: URL) {
   } catch (error) {
     if (error instanceof ScanError) throw error;
     const message = String(error);
-    if (/closed|Target page, context or browser has been closed/i.test(message) && Date.now() - started >= BUDGET.totalMs - 500) throw new ScanError("timeout");
+    if (/closed|Target page, context or browser has been closed/i.test(message) && Date.now() - started >= wait.total - 500) throw new ScanError("timeout");
     throw new ScanError("internal", message.slice(0, 300));
   } finally {
     clearTimeout(deadline);
@@ -139,15 +161,24 @@ export async function guardContext(context: BrowserContext) {
   await context.routeWebSocket(/.*/, (socket) => socket.close());
 }
 
+/** Hide consent banners; if that hides much of the page too (a banner wrapping everything), put it back. */
+async function cleanBanners(page: Page) {
+  const before = await page.evaluate(() => document.documentElement.scrollHeight).catch(() => 0);
+  const tag = await page.addStyleTag({ content: CLEAN_CSS }).catch(() => null);
+  if (!tag) return;
+  const after = await page.evaluate(() => document.documentElement.scrollHeight).catch(() => 0);
+  if (before && after < before * 0.6) await tag.evaluate((element) => (element as Element).remove()).catch(() => {});
+}
+
 /** Let the page finish: load, lazy content by scrolling through once, fonts, then back to the top. */
-async function settle(page: Page) {
-  await page.waitForLoadState("load", { timeout: BUDGET.settleMs }).catch(() => {});
-  await page.waitForLoadState("networkidle", { timeout: 2500 }).catch(() => {});
+async function settle(page: Page, wait: (typeof WAIT)["normal"], maxHeight: number) {
+  await page.waitForLoadState("load", { timeout: wait.load }).catch(() => {});
+  await page.waitForLoadState("networkidle", { timeout: wait.idle }).catch(() => {});
   await page
     .evaluate(`(async () => {
-      const limit = ${GENERIC_PAGE.maxHeight};
+      const limit = ${maxHeight};
       const start = Date.now();
-      for (let y = 0; y < Math.min(document.documentElement.scrollHeight, limit) && Date.now() - start < 4000; y += innerHeight) {
+      for (let y = 0; y < Math.min(document.documentElement.scrollHeight, limit) && Date.now() - start < ${wait.scroll}; y += innerHeight) {
         scrollTo(0, y);
         await new Promise((r) => setTimeout(r, 90));
       }
@@ -204,7 +235,7 @@ function clean(box: ScanBox): ScanBox {
  * How bright each image really is: one screenshot of the whole page at 1/16 scale (each pixel is a 16 × 16 block),
  * decoded in a blank page, averaged over each media box. Cross-origin images cannot be read inside the page itself.
  */
-async function readMediaBrightness(context: BrowserContext, page: Page, boxes: ScanBox[], height: number) {
+async function readMediaBrightness(context: BrowserContext, page: Page, boxes: ScanBox[], height: number, width: number) {
   const media = boxes.filter((box) => box.kind === "media" && box.top < BUDGET.lumaHeight);
   if (!media.length) return;
   const scale = 1 / 16;
@@ -212,7 +243,7 @@ async function readMediaBrightness(context: BrowserContext, page: Page, boxes: S
   const shot = (await cdp.send("Page.captureScreenshot", {
     format: "png",
     captureBeyondViewport: true,
-    clip: { x: 0, y: 0, width: VIEWPORT.width, height: Math.min(height, BUDGET.lumaHeight), scale },
+    clip: { x: 0, y: 0, width, height: Math.min(height, BUDGET.lumaHeight), scale },
   })) as { data: string };
   await cdp.detach().catch(() => {});
   const blank = await context.newPage();

@@ -37,7 +37,7 @@ export const BUDGET = {
   bytes: 25 * 1024 * 1024,
   boxes: 12_000,
   /** Media brightness is read from a screenshot of at most this much of the page. */
-  lumaHeight: process.env.VERCEL ? 6_000 : 16_000,
+  lumaHeight: process.env.VERCEL ? 3_000 : 16_000,
 };
 
 export const USER_AGENT = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36 alexsonicLAb/0.1";
@@ -63,31 +63,36 @@ export async function scanUrl(url: URL, options: ScanOptions = DEFAULT_OPTIONS):
  */
 async function withDeadline(url: URL, options: ScanOptions) {
   const limit = WAIT[options.wait].total + 2_000;
+  const marks: string[] = [];
   let timer: ReturnType<typeof setTimeout> | undefined;
   const expired = new Promise<never>((_, reject) => {
     timer = setTimeout(() => reject(new ScanError("timeout", `no answer after ${limit}ms`)), limit);
   });
   try {
-    return await Promise.race([render(url, options), expired]);
+    return await Promise.race([render(url, options, marks), expired]);
   } catch (error) {
-    if (error instanceof ScanError && error.code === "timeout") await resetBrowser();
+    if (error instanceof ScanError && error.code === "timeout") {
+      console.warn(`scan stuck ${url.host} after ${marks.join(" ") || "nothing"}`);
+      await resetBrowser();
+    }
     throw error;
   } finally {
     clearTimeout(timer);
   }
 }
 
-async function render(url: URL, options: ScanOptions) {
+async function render(url: URL, options: ScanOptions, marks: string[] = []) {
   const wait = WAIT[options.wait];
   const started = Date.now();
   // Where the time goes, in the logs: each phase's end, in ms since the start.
-  const marks: string[] = [];
   const mark = (name: string) => marks.push(`${name}=${Date.now() - started}`);
   const proxy = await startGuardProxy({ maxConnections: BUDGET.connections, maxBytes: BUDGET.bytes });
   let context: BrowserContext | null = null;
   const deadline = setTimeout(() => void context?.close().catch(() => {}), wait.total);
   try {
+    mark("proxy");
     const browser = await getBrowser();
+    mark("launch");
     context = await browser.newContext({
       viewport: { width: options.width, height: options.height },
       colorScheme: options.dark ? "dark" : "light",
@@ -103,6 +108,7 @@ async function render(url: URL, options: ScanOptions) {
       // Loopback is not exempt from the proxy: everything goes through the guard.
       proxy: { server: proxy.server, bypass: "<-loopback>" },
     });
+    mark("context");
     await guardContext(context);
     const page = await context.newPage();
     page.on("dialog", (dialog) => void dialog.dismiss().catch(() => {}));
@@ -151,7 +157,7 @@ async function render(url: URL, options: ScanOptions) {
     if (boxes.filter((box) => box.kind === "text" || box.kind === "heading").length < 3) throw new ScanError("empty");
     mark("snapshot");
     // Image brightness needs a tall screenshot, which is slow without a GPU: only with time to spare, and capped.
-    if (Date.now() - started < wait.total * 0.45) await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
+    if (Date.now() - started < wait.total * (process.env.VERCEL ? 0.3 : 0.45)) await readMediaBrightness(context, page, boxes, raw.height, options.width).catch(() => {});
     mark("luma");
 
     const snapshot: ScanSnapshot = {

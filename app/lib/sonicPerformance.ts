@@ -9,7 +9,8 @@ import type { DeckState } from "../components/SonicDeck";
 export type PerformanceEvent =
   | [number, "y", number] // read head position
   | [number, "deck", DeckState]
-  | [number, "hold", number] // loop length in bars, 0 = release
+  | [number, "load", number] // bars captured into deck A, 0 = eject
+  | [number, "xfade", number] // crossfader, 0 = deck A, 1 = deck B
   | [number, "roll", number] // roll length in sixteenths, 0 = release
   | [number, "pixel", PixelMode]
   | [number, "carve", number[]];

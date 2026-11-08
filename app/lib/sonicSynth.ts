@@ -1,6 +1,10 @@
 import { PLAYERS, type PlayerId, type SonicStyle } from "../data/sonicStyles";
 import { hitPlayer, type Hit } from "./sonicPlayers";
 
+/** Deck A plays a captured loop, deck B the live scan; the crossfader sets how much of each is heard. */
+export type DeckId = "a" | "b";
+export type DeckHit = { deck: DeckId; hit: Hit };
+
 /**
  * alexsonicLAb's sound engine, synthesised in Web Audio with no samples. Drums go straight to the mix; each player
  * has its own channel (level, mute) with sends to a tempo-synced delay and a generated reverb. A look-ahead
@@ -18,7 +22,8 @@ export class SonicSynth {
   private filter: BiquadFilterNode;
   private output: GainNode;
   private noise: AudioBuffer;
-  private channels = new Map<PlayerId, GainNode>();
+  private channels = new Map<string, GainNode>();
+  private decks = new Map<DeckId, GainNode>();
   private delaySend: GainNode;
   private reverbSend: GainNode;
   private delay: DelayNode;
@@ -35,7 +40,7 @@ export class SonicSynth {
   private scheduled: { time: number; step: number }[] = [];
   onBar: (style: SonicStyle) => void = () => {};
 
-  constructor(style: SonicStyle, private compose: (style: SonicStyle, step: number, count: number) => Hit[]) {
+  constructor(style: SonicStyle, private compose: (style: SonicStyle, step: number, count: number) => DeckHit[]) {
     this.style = style;
     this.context = new AudioContext({ latencyHint: "interactive" });
     const ctx = this.context;
@@ -84,12 +89,18 @@ export class SonicSynth {
     reverb.buffer = impulse;
     this.reverbSend.connect(reverb).connect(this.bus);
 
-    for (const player of PLAYERS) {
-      const channel = ctx.createGain();
-      channel.gain.value = style.mix[player.id];
-      channel.connect(this.bus);
-      this.channels.set(player.id, channel);
+    for (const deck of ["a", "b"] as DeckId[]) {
+      const deckGain = ctx.createGain();
+      deckGain.connect(this.bus);
+      this.decks.set(deck, deckGain);
+      for (const player of PLAYERS) {
+        const channel = ctx.createGain();
+        channel.gain.value = style.mix[player.id];
+        channel.connect(deckGain);
+        this.channels.set(`${deck}:${player.id}`, channel);
+      }
     }
+    this.setCrossfade(1);
     this.applyStyle(style);
   }
 
@@ -111,7 +122,7 @@ export class SonicSynth {
         }
         if (this.step === 0) this.onBar(this.style);
         const swing = this.step % 2 === 1 ? this.style.swing * this.stepTime : 0;
-        for (const hit of this.compose(this.style, this.step, this.count)) this.play(hit, this.nextTime + swing);
+        for (const { deck, hit } of this.compose(this.style, this.step, this.count)) this.play(hit, this.nextTime + swing, deck);
         this.scheduled.push({ time: this.nextTime, step: this.step });
         if (this.scheduled.length > 32) this.scheduled.shift();
         this.nextTime += this.stepTime;
@@ -138,7 +149,15 @@ export class SonicSynth {
 
   /** Player level, 0 to 1; muting is a level of 0. */
   setLevel(player: PlayerId, level: number) {
-    this.channels.get(player)?.gain.setTargetAtTime(Math.max(0, Math.min(1, level)), this.context.currentTime, 0.03);
+    for (const deck of ["a", "b"]) this.channels.get(`${deck}:${player}`)?.gain.setTargetAtTime(Math.max(0, Math.min(1, level)), this.context.currentTime, 0.03);
+  }
+
+  /** The crossfader: 0 is deck A alone, 1 is deck B alone, with equal-power curves in between. */
+  setCrossfade(x: number) {
+    const v = Math.max(0, Math.min(1, x));
+    const now = this.context.currentTime;
+    this.decks.get("a")?.gain.setTargetAtTime(Math.cos((v * Math.PI) / 2), now, 0.02);
+    this.decks.get("b")?.gain.setTargetAtTime(Math.sin((v * Math.PI) / 2), now, 0.02);
   }
 
   /** Delay and reverb amount, 0 to 1, where 0.5 is the style's own amount. */
@@ -221,13 +240,15 @@ export class SonicSynth {
     window.setTimeout(() => void ctx.close(), fade * 1000 + 200);
   }
 
-  private play(hit: Hit, t: number) {
+  private play(hit: Hit, t: number, deck: DeckId) {
     const player = hitPlayer(hit);
     this.lastHit.set(player ?? "drums", t);
-    const out = player ? this.channels.get(player)! : this.bus;
+    this.lastHit.set(`deck:${deck}`, t);
+    const deckOut = this.decks.get(deck)!;
+    const out = player ? this.channels.get(`${deck}:${player}`)! : deckOut;
     switch (hit.voice) {
-      case "kick": return this.kick(t);
-      case "clap": return this.clap(t);
+      case "kick": return this.kick(t, deckOut);
+      case "clap": return this.clap(t, deckOut);
       case "snare": return this.snare(t, hit.gain, out);
       case "ghost": return this.snare(t, 0.28, out);
       case "hat": return this.hat(t, hit.open, out);
@@ -262,7 +283,7 @@ export class SonicSynth {
     return src;
   }
 
-  private kick(t: number) {
+  private kick(t: number, out: AudioNode) {
     const ctx = this.context;
     const osc = ctx.createOscillator();
     const gain = ctx.createGain();
@@ -270,12 +291,12 @@ export class SonicSynth {
     osc.frequency.exponentialRampToValueAtTime(44, t + 0.11);
     gain.gain.setValueAtTime(1, t);
     gain.gain.exponentialRampToValueAtTime(0.001, t + 0.42);
-    osc.connect(gain).connect(this.bus);
+    osc.connect(gain).connect(out);
     osc.start(t);
     osc.stop(t + 0.45);
   }
 
-  private clap(t: number) {
+  private clap(t: number, out: AudioNode) {
     const ctx = this.context;
     const bp = ctx.createBiquadFilter();
     bp.type = "bandpass";
@@ -290,7 +311,7 @@ export class SonicSynth {
     gain.gain.setValueAtTime(0.32, t + 0.03);
     gain.gain.exponentialRampToValueAtTime(0.001, t + 0.2);
     this.noiseSource(t, 0.22).connect(bp).connect(gain);
-    this.route(gain, this.bus, 0, 0.3);
+    this.route(gain, out, 0, 0.3);
   }
 
   private snare(t: number, level: number, out: AudioNode) {

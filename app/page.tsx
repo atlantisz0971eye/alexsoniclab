@@ -23,7 +23,7 @@ const EXAMPLES = [
   { label: "HACKER NEWS", url: "https://news.ycombinator.com/" },
 ];
 
-const ENTER = { loud: "[NEW URL ↵]", silent: "[NEW URL ↵]", short: "[URL ↵]", title: "Leave the Lab and read another site" };
+const ENTER = { loud: "NEW URL", silent: "NEW URL", loudHint: "the sound stops when you leave", silentHint: "or click anywhere for sound" };
 const withScheme = (input: string) => (/^[a-z][a-z0-9+.-]*:/i.test(input.trim()) ? input.trim() : `https://${input.trim()}`);
 
 export default function Home() {

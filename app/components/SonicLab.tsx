@@ -6,10 +6,14 @@ import { Ink, ROW_PX, readRow, snapshotPage, type ScanRow, type ScanSnapshot } f
 import { decodePerformance, encodePerformance, type Performance, type PerformanceEvent, type PixelMode } from "../lib/sonicPerformance";
 import { compose, DEFAULT_ROUTES, type Routes } from "../lib/sonicPlayers";
 import { SOURCES } from "../lib/sonicSignals";
-import { SonicSynth } from "../lib/sonicSynth";
+import { SonicSynth, type DeckHit } from "../lib/sonicSynth";
 import { prefersReducedMotion } from "../utils/environment";
-import { SonicDeck, type DeckState, type EnterLabels, type PerformState } from "./SonicDeck";
+import { platter, SonicDeck, type DeckState, type PerformState } from "./SonicDeck";
 import "./sonicLab.css";
+
+/** The way out of the Lab: into the portfolio by default, or wherever the host page goes. */
+export type EnterLabels = { loud: string; silent: string; loudHint: string; silentHint: string };
+const PORTFOLIO_ENTER: EnterLabels = { loud: "ENTER", silent: "ENTER SILENTLY", loudHint: "the sound stops at the door", silentHint: "or click anywhere for sound" };
 
 type SonicLabProps = {
   open: boolean;
@@ -19,19 +23,20 @@ type SonicLabProps = {
    * portfolio's `main`, and reads it again when its layout changes.
    */
   snapshot?: ScanSnapshot | null;
-  /** The query that opens this Lab again, for share and replay links. */
+  /** The query that opens this Lab again, for replay links. */
   linkQuery?: string;
   /** Leave on its own once the whole page has been read. */
   autoEnter?: boolean;
-  /** What the way out is called on the deck. */
+  /** What the way out is called. */
   enterLabels?: EnterLabels;
 };
 
 /**
  * alexsonicLAb: an opaque instrument over the real portfolio. The read head is a fixed axis across the screen;
  * scrolling moves the page under it, rows above the axis have been read and rows below are what comes next. The
- * axis shows only the row being read, as pixels; everything else is on the ASCII DJ deck below: styles, players,
- * loop and roll, remix wiring, pixel modes, carving, recording and replayable performance links.
+ * axis shows only the row being read, as pixels; below it an ASCII DJ console with two decks: deck A loops a
+ * fragment captured from the scan, deck B is the live scan, and a crossfader mixes them. Plus styles, player
+ * mutes, roll, pixel modes, carving, recording and replayable performance links.
  * Sound lives only here and shuts down on entering the portfolio.
  */
 
@@ -135,7 +140,7 @@ const download = (blob: Blob, name: string) => {
 };
 const stamp = () => new Date().toISOString().slice(0, 16).replace(/[-:T]/g, "");
 
-export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "scan", autoEnter = true, enterLabels }: SonicLabProps) {
+export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "scan", autoEnter = true, enterLabels = PORTFOLIO_ENTER }: SonicLabProps) {
   const rootRef = useRef<HTMLDivElement | null>(null);
   const fieldRef = useRef<HTMLCanvasElement | null>(null);
   const axisRef = useRef<HTMLCanvasElement | null>(null);
@@ -148,7 +153,8 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
   const [deck, setDeck] = useState<DeckState | null>(null);
   const deckRef = useRef<DeckState | null>(null);
   deckRef.current = deck;
-  const [perform, setPerform] = useState<PerformState>({ hold: false, loopBars: 1, roll: 0, pixel: "normal", carved: 0, recording: false, take: null, replay: null });
+  const [perform, setPerform] = useState<PerformState>({ loaded: 0, loadBars: 2, xfade: 1, roll: 0, pixel: "normal", carved: 0, recording: false, take: null, replay: null });
+  const [loopSection, setLoopSection] = useState<string | null>(null);
   const performRef = useRef(perform);
   performRef.current = perform;
 
@@ -160,10 +166,11 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     row: -1,
     bar: [] as ScanRow[],
     history: [] as ScanRow[],
-    hold: null as ScanRow[] | null,
-    scrub: 0,
+    // Deck A: a fragment of the scan, looping. The crossfader: 0 is deck A alone, 1 is deck B (live) alone.
+    deckA: null as ScanRow[] | null,
+    xfade: 1,
     roll: null as { length: number; from: number } | null,
-    playing: null as ScanRow | null,
+    loopIndex: 0,
     carved: new Set<number>(),
     carveVersion: 0,
     pixel: "normal" as PixelMode,
@@ -232,29 +239,38 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
   const toggle = useCallback((list: "mutes" | "solos", player: PlayerId) => {
     updateDeck((d) => ({ ...d, [list]: d[list].includes(player) ? d[list].filter((p) => p !== player) : [...d[list], player] }));
   }, [updateDeck]);
-  const rewire = useCallback((player: PlayerId) => {
-    updateDeck((d) => ({ ...d, routes: { ...d.routes, [player]: SOURCES[(SOURCES.indexOf(d.routes[player]) + 1) % SOURCES.length] } }));
-  }, [updateDeck]);
-
-  /** Hold the last bars as a loop (or let go). While held, scrolling scrubs inside it. */
-  const setHold = useCallback((bars: number) => {
+  /** Capture the last bars of the live deck into deck A, where they loop until reloaded or ejected. */
+  const load = useCallback((bars: number) => {
     const s = state.current;
     if (bars > 0) {
       const rows = s.history.slice(-bars * 16);
       while (rows.length && rows.length < bars * 16) rows.push(...rows.slice(0, bars * 16 - rows.length));
-      s.hold = rows.length ? rows : null;
-      s.scrub = 0;
+      if (!rows.length) return;
+      s.deckA = rows;
+      // A freshly loaded loop comes in at half, so both decks are heard.
+      if (s.xfade > 0.9) {
+        s.xfade = 0.5;
+        s.synth?.setCrossfade(0.5);
+      }
+      const section = rows[rows.length - 1].section;
+      setLoopSection(section);
     } else {
-      s.hold = null;
+      s.deckA = null;
+      s.xfade = 1;
+      s.synth?.setCrossfade(1);
     }
-    setPerform((p) => ({ ...p, hold: !!s.hold, loopBars: bars > 0 ? bars : p.loopBars }));
-    note(["hold", s.hold ? bars : 0]);
+    setPerform((p) => ({ ...p, loaded: s.deckA ? bars : 0, loadBars: bars > 0 ? bars : p.loadBars, xfade: s.xfade }));
+    note(["load", s.deckA ? bars : 0]);
   }, [note]);
-  const toggleHold = useCallback(() => setHold(state.current.hold ? 0 : performRef.current.loopBars), [setHold]);
-  const setLoopBars = useCallback((bars: number) => {
-    if (state.current.hold) setHold(bars);
-    else setPerform((p) => ({ ...p, loopBars: bars }));
-  }, [setHold]);
+  const setLoadBars = useCallback((bars: number) => setPerform((p) => ({ ...p, loadBars: bars })), []);
+
+  const setXfade = useCallback((value: number) => {
+    const s = state.current;
+    s.xfade = Math.max(0, Math.min(1, value));
+    s.synth?.setCrossfade(s.xfade);
+    setPerform((p) => ({ ...p, xfade: s.xfade }));
+    note(["xfade", Math.round(s.xfade * 100) / 100]);
+  }, [note]);
 
   /** Repeat the current sixteenths while a roll key is held. */
   const setRoll = useCallback((length: number) => {
@@ -283,22 +299,6 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     setPerform((p) => ({ ...p, carved: s.carved.size }));
     note(["carve", cols]);
   }, [note]);
-
-  const share = useCallback(async () => {
-    const d = deckRef.current;
-    if (!d) return false;
-    const parts = [linkQuery, `style=${d.pending ?? d.style}`];
-    if (d.mutes.length) parts.push(`mute=${d.mutes.join(",")}`);
-    if (d.solos.length) parts.push(`solo=${d.solos.join(",")}`);
-    const rewired = PLAYERS.filter((p) => d.routes[p.id] !== DEFAULT_ROUTES[p.id]).map((p) => `${p.id}.${d.routes[p.id]}`);
-    if (rewired.length) parts.push(`route=${rewired.join(",")}`);
-    try {
-      await navigator.clipboard.writeText(`${window.location.origin}${window.location.pathname}?${parts.join("&")}`);
-      return true;
-    } catch {
-      return false;
-    }
-  }, [linkQuery]);
 
   /** Start or stop recording: the sound into a file, the performance into a replayable link. */
   const record = useCallback(() => {
@@ -398,7 +398,8 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       s.replayTimers.push(window.setTimeout(() => {
         if (kind === "y") s.moveTo(value as number);
         else if (kind === "deck") setDeckState(value as DeckState, false);
-        else if (kind === "hold") setHold(value as number);
+        else if (kind === "load") load(value as number);
+        else if (kind === "xfade") setXfade(value as number);
         else if (kind === "roll") setRoll(value as number);
         else if (kind === "pixel") setPixel(value as PixelMode);
         else if (kind === "carve") setCarved(value as number[]);
@@ -409,7 +410,7 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       s.replayTimers = [];
       setPerform((p) => ({ ...p, replay: null }));
     }, end + 2000));
-  }, [setDeckState, setHold, setRoll, setPixel, setCarved]);
+  }, [setDeckState, load, setXfade, setRoll, setPixel, setCarved]);
 
   const enter = useCallback(() => {
     const s = state.current;
@@ -435,21 +436,22 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     try {
       const synth = new SonicSynth(styleById(d.style), (style, step, count) => {
         let n = count;
-        // A roll repeats the same few sixteenths over and over.
+        // A roll repeats the same few sixteenths over and over, on both decks.
         if (s.roll) n = s.roll.from + ((n - s.roll.from) % s.roll.length);
-        let rows = s.bar;
-        let position = s.roll ? n % 16 : step;
-        if (s.hold) {
-          // A held loop plays its own rows; scrubbing shifts where in them it plays.
-          const length = s.hold.length;
-          const index = (((n + Math.round(s.scrub)) % length) + length) % length;
-          const barStart = index - (index % 16);
-          rows = s.hold.slice(barStart, barStart + 16);
-          position = index % 16;
-        }
-        s.playing = rows.length ? rows[position % rows.length] : null;
+        const position = s.roll ? n % 16 : step;
         const wiring = { routes: deckRef.current?.routes ?? DEFAULT_ROUTES, carved: s.carved, carveVersion: s.carveVersion };
-        return compose(style, rows, position, wiring);
+        const hits: DeckHit[] = [];
+        // Deck B: the bar just scanned.
+        if (s.xfade > 0.001) for (const hit of compose(style, s.bar, position, wiring)) hits.push({ deck: "b", hit });
+        // Deck A: its loop, bar by bar.
+        const loop = s.deckA;
+        if (loop && s.xfade < 0.999) {
+          const index = n % loop.length;
+          const barStart = index - (index % 16);
+          for (const hit of compose(style, loop.slice(barStart, barStart + 16), index % 16, wiring)) hits.push({ deck: "a", hit });
+          s.loopIndex = index;
+        }
+        return hits;
       });
       // When a pending style starts on the bar line, the deck shows it as the one playing.
       synth.onBar = (style) => {
@@ -612,7 +614,7 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       const { w: width, h: height } = s.size;
       axisCtx.clearRect(0, 0, width, height);
       const mid = Math.round(height * AXIS);
-      const row = (s.hold && s.playing) || rowAt(s.row);
+      const row = rowAt(s.row);
       const accent = accentOf(row?.section);
       const [r, g, b] = accent;
       axisCtx.fillStyle = "rgba(11,11,12,0.9)";
@@ -632,7 +634,7 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       // Carved columns: cut out of the axis and out of every source the players read.
       axisCtx.fillStyle = "rgba(255,90,77,0.7)";
       for (const c of s.carved) axisCtx.fillRect(c * cw + cw / 2 - 0.5, mid - 15, 1, 30);
-      axisCtx.fillStyle = s.hold ? "rgba(90,240,138,0.8)" : `rgba(${r},${g},${b},0.55)`;
+      axisCtx.fillStyle = `rgba(${r},${g},${b},0.55)`;
       axisCtx.fillRect(0, mid - 16, width, 1);
       axisCtx.fillRect(0, mid + 15, width, 1);
     };
@@ -684,7 +686,17 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     /** The deck's meters, filter readout and step lights, written straight into their spans. */
     const drawLive = () => {
       const synth = s.synth;
+      // The turntables: the marker goes round once a bar; deck A only turns while it holds a loop.
+      const step = synth ? synth.playhead() : -1;
+      const spinB = synth && step >= 0 ? platter(Math.floor(step / 2)) : platter(null);
+      const spinA = synth && s.deckA && step >= 0 ? platter(Math.floor((s.loopIndex % 16) / 2)) : platter(null);
       for (const [name, element] of live.current) {
+        if (name.startsWith("plat")) {
+          const line = Number(name.slice(6)); // "platA:3" → 3
+          const next = (name.startsWith("platA") ? spinA : spinB)[line];
+          if (element.textContent !== next) element.textContent = next;
+          continue;
+        }
         const length = element.textContent?.length ?? 0;
         if (!length) continue;
         if (name.startsWith("meter:")) {
@@ -700,7 +712,6 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
           const lit = Math.round(Math.max(0, Math.min(1, amount)) * length);
           element.textContent = "▇".repeat(lit) + "▁".repeat(length - lit);
         } else if (name === "steps") {
-          const step = synth ? synth.playhead() : -1;
           element.textContent = Array.from({ length }, (_, i) => (i === step ? "■" : i % 4 === 0 ? "▪" : "·")).join("");
         }
       }
@@ -734,12 +745,6 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     const move = (delta: number) => {
       if (!s.snapshot || s.leaving) return;
       setStarted(true);
-      // While a loop is held, scrolling scrubs inside it instead: the page stays where it is.
-      if (s.hold) {
-        s.scrub += delta / ROW_PX;
-        s.moved += Math.abs(delta);
-        return;
-      }
       const max = s.snapshot.height - 1;
       s.readY = Math.max(0, Math.min(max, s.readY + delta));
       s.moved += Math.abs(delta);
@@ -810,9 +815,13 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
         event.preventDefault();
         power();
         toggle(event.shiftKey ? "solos" : "mutes", player.id);
-      } else if (event.code === "KeyH") {
+      } else if (event.code === "KeyL") {
         event.preventDefault();
-        toggleHold();
+        power();
+        load(performRef.current.loadBars);
+      } else if (event.key === "ArrowLeft" || event.key === "ArrowRight") {
+        event.preventDefault();
+        setXfade(s.xfade + (event.key === "ArrowLeft" ? -0.125 : 0.125));
       } else if (event.code in rollKeys && !event.repeat) {
         event.preventDefault();
         setRoll(rollKeys[event.code]);
@@ -890,11 +899,12 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       s.synth = null;
       s.bar = [];
       s.history = [];
-      s.hold = null;
+      s.deckA = null;
+      s.xfade = 1;
       s.roll = null;
       s.take = null;
     };
-  }, [open, given, enter, power, chooseStyle, toggle, toggleHold, setRoll, setPixel, setCarved, stopReplay]);
+  }, [open, given, enter, power, chooseStyle, toggle, load, setXfade, setRoll, setPixel, setCarved, stopReplay]);
 
   // Reset for the next time the Lab is opened from the header.
   useEffect(() => {
@@ -902,15 +912,15 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
     setLeaving(false);
     setStarted(false);
     setPowered(false);
-    setPerform((p) => ({ ...p, hold: false, roll: 0, recording: false, replay: null }));
+    setPerform((p) => ({ ...p, loaded: 0, xfade: 1, roll: 0, recording: false, replay: null }));
   }, [open]);
 
-  // Scanned to the end: the scan completes and opens onto the page (not while a loop is held or a replay runs).
+  // Scanned to the end: the scan completes and opens onto the page (not while deck A loops or a replay runs).
   useEffect(() => {
-    if (!autoEnter || !open || !readout.complete || leaving || perform.hold || perform.replay) return;
+    if (!autoEnter || !open || !readout.complete || leaving || perform.loaded || perform.replay) return;
     const timer = window.setTimeout(enter, 2200);
     return () => window.clearTimeout(timer);
-  }, [autoEnter, open, readout.complete, readout.y, leaving, perform.hold, perform.replay, enter]);
+  }, [autoEnter, open, readout.complete, readout.y, leaving, perform.loaded, perform.replay, enter]);
 
   const registerLive = useCallback((name: string, element: HTMLSpanElement | null) => {
     if (element) live.current.set(name, element);
@@ -919,7 +929,7 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
 
   if (!open) return null;
   const percent = Math.min(100, Math.round((readout.y / Math.max(1, readout.height)) * 100));
-  const label = perform.replay === "ready" ? "REPLAY · CLICK TO PLAY" : perform.replay === "playing" ? "REPLAYING" : perform.hold ? "LOOP HELD" : readout.complete ? "SCAN COMPLETE" : started ? "SCANNING" : "STANDBY";
+  const label = perform.replay === "ready" ? "REPLAY · CLICK TO PLAY" : perform.replay === "playing" ? "REPLAYING" : readout.complete ? "SCAN COMPLETE" : started ? "SCANNING" : "STANDBY";
 
   return (
     <div
@@ -934,38 +944,41 @@ export function SonicLab({ open, onClose, snapshot: given = null, linkQuery = "s
       <canvas ref={fieldRef} className="sonic-lab__canvas" aria-hidden />
       <canvas ref={axisRef} className="sonic-lab__canvas" aria-hidden />
 
-      {deck && (
-        <SonicDeck
-          state={deck}
-          bpm={styleById(deck.pending ?? deck.style).bpm}
-          onStyle={chooseStyle}
-          onLevel={(player, level) => updateDeck((d) => ({ ...d, levels: { ...d.levels, [player]: level } }))}
-          onMute={(player) => toggle("mutes", player)}
-          onSolo={(player) => toggle("solos", player)}
-          onSends={(delay, reverb) => updateDeck((d) => ({ ...d, delay, reverb }))}
-          onShare={share}
-          registerLive={registerLive}
-          scopeRef={scope}
-          status={{ label, y: readout.y, height: readout.height, percent, section: readout.section }}
-          powered={powered}
-          onEnter={enter}
-          enterLabels={enterLabels}
-          perform={perform}
-          build={BUILD}
-          actions={{
-            onHold: toggleHold,
-            onLoopBars: setLoopBars,
-            onRoll: setRoll,
-            onPixel: setPixel,
-            onClearCarve: () => setCarved([]),
-            onRecord: record,
-            onSaveAudio: saveAudio,
-            onCopyLink: copyLink,
-            onPoster: savePoster,
-            onRoute: rewire,
-          }}
-        />
-      )}
+      <div className="sonic-lab__bottom">
+        {/* The way into the portfolio, always in reach: the Lab is a welcome page first. */}
+        <button type="button" className="sonic-enter" onClick={(event) => { event.stopPropagation(); enter(); }}>
+          <span>{powered ? enterLabels.loud : enterLabels.silent}</span>
+          <b>↵</b>
+          <small>{powered ? enterLabels.loudHint : enterLabels.silentHint}</small>
+        </button>
+        {deck && (
+          <SonicDeck
+            state={deck}
+            perform={perform}
+            bpm={styleById(deck.pending ?? deck.style).bpm}
+            status={{ label, y: readout.y, height: readout.height, percent, section: readout.section }}
+            loopSection={loopSection}
+            build={BUILD}
+            registerLive={registerLive}
+            scopeRef={scope}
+            actions={{
+              onStyle: (id) => { power(); chooseStyle(id); },
+              onMute: (player) => toggle("mutes", player),
+              onLoad: () => { power(); load(perform.loadBars); },
+              onLoadBars: (bars) => (perform.loaded ? load(bars) : setLoadBars(bars)),
+              onEject: () => load(0),
+              onXfade: setXfade,
+              onRoll: setRoll,
+              onPixel: setPixel,
+              onClearCarve: () => setCarved([]),
+              onRecord: record,
+              onSaveAudio: saveAudio,
+              onCopyLink: copyLink,
+              onPoster: savePoster,
+            }}
+          />
+        )}
+      </div>
     </div>
   );
 }
